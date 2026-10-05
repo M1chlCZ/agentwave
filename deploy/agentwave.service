@@ -1,0 +1,19 @@
+[Unit]
+Description=agentwave agent assistant
+After=network.target
+
+[Service]
+Type=simple
+User=agentwave
+Group=agentwave
+ExecStart=/usr/local/bin/agentwave --socket /run/agentwave/agentwave.sock --policy /etc/agentwave/policy.json --model gpt-5.6-sol --home /var/lib/agentwave
+RuntimeDirectory=agentwave
+StateDirectory=agentwave
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

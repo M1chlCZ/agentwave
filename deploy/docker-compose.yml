@@ -1,0 +1,21 @@
+services:
+  agentwave:
+    build:
+      context: ..
+    image: agentwave:latest
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - ./policy.json:/etc/agentwave/policy.json:ro
+      - agentwave-run:/run/agentwave
+      # Mount a pre-authenticated Codex home when the model needs credentials:
+      # - ./codex-home:/home/agent/.codex
+    tmpfs:
+      - /tmp
+    restart: unless-stopped
+
+volumes:
+  agentwave-run:

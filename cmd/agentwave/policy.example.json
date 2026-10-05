@@ -1,0 +1,8 @@
+{
+  "actions": ["help", "navigate", "lookup"],
+  "modules": ["none", "home", "contacts", "deals", "reports"],
+  "routePrefix": "/admin",
+  "queryActions": {
+    "lookup": "contacts"
+  }
+}
