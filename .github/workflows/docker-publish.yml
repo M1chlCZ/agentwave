@@ -69,7 +69,13 @@ jobs:
       - name: Copy tags to Docker Hub
         if: ${{ env.DOCKERHUB_LOGIN != '' }}
         run: |
-          docker buildx imagetools create \
-            -t "$DOCKERHUB_LOGIN/agentwave:${{ github.ref_name }}" \
-            -t "$DOCKERHUB_LOGIN/agentwave:latest" \
-            "ghcr.io/m1chlcz/agentwave:${{ github.ref_name }}"
+          if [[ "$GITHUB_REF_NAME" == *-* ]]; then
+            docker buildx imagetools create \
+              -t "$DOCKERHUB_LOGIN/agentwave:${GITHUB_REF_NAME}" \
+              "ghcr.io/m1chlcz/agentwave:${GITHUB_REF_NAME}"
+          else
+            docker buildx imagetools create \
+              -t "$DOCKERHUB_LOGIN/agentwave:${GITHUB_REF_NAME}" \
+              -t "$DOCKERHUB_LOGIN/agentwave:latest" \
+              "ghcr.io/m1chlcz/agentwave:${GITHUB_REF_NAME}"
+          fi
