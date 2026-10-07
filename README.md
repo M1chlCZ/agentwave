@@ -106,8 +106,20 @@ CGO_ENABLED=0 GOOS=linux go build -trimpath -ldflags="-s -w" -o agentwave ./cmd/
 
 ### Docker
 
-Build the image and run the container. The policy file is read-only. The socket
-lives in a named volume.
+Prebuilt images are published for `linux/amd64` and `linux/arm64` when a `v*`
+tag is pushed:
+
+```
+ghcr.io/m1chlcz/agentwave
+m1chl/agentwave
+```
+
+The image tag matches the Git tag (for example `v0.1.0`). The `latest` tag
+follows stable releases only. Add `--policy`, `--socket` and `--model` like the
+local binary.
+
+Build the image yourself and run the container. The policy file is read-only.
+The socket lives in a named volume.
 
 ```sh
 docker build -t agentwave .
