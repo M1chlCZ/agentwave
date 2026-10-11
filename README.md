@@ -1,5 +1,10 @@
 # agentwave
 
+[![CI](https://github.com/M1chlCZ/agentwave/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/M1chlCZ/agentwave/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/github/license/M1chlCZ/agentwave)](LICENSE)
+[![Docker Hub](https://img.shields.io/docker/v/m1chl/agentwave/latest?color=green&label=Docker%20Hub&logo=docker&style=flat)](https://hub.docker.com/r/m1chl/agentwave)
+[![Docker Pulls](https://img.shields.io/docker/pulls/m1chl/agentwave?logo=docker&style=flat)](https://hub.docker.com/r/m1chl/agentwave)
+
 agentwave is an embeddable agent assistant for CRM systems, admin panels,
 dashboards and internal tools. It turns a short request and the current screen
 route into one validated suggestion. The suggestion proposes exactly one action.
