@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"io"
 	"os"
 	"path/filepath"
@@ -9,6 +10,9 @@ import (
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/m1chlcz/agentwave"
+	"github.com/m1chlcz/agentwave/codex"
 )
 
 func writePolicy(t *testing.T, content string) string {
@@ -190,5 +194,60 @@ func TestRunReportsConfigErrorsAndExitsTwo(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "invalid policy") {
 		t.Fatalf("invalid policy message: %q", stderr.String())
+	}
+}
+
+func TestReloadPolicyAppliesAndKeepsOldOnFailure(t *testing.T) {
+	t.Parallel()
+
+	policyPath := writePolicy(
+		t,
+		`{"actions":["help"],"modules":["none"],"templates":{"greet":"Hello {{who}}."}}`,
+	)
+	policy, err := loadPolicy(policyPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := agentwave.NewStore(
+		context.Background(),
+		policy,
+		func(context.Context, string, string) (agentwave.Suggestion, error) {
+			return agentwave.Suggestion{Message: "Done", Action: "help", Module: "none"}, nil
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(store.Close)
+	runner, err := codex.New(codex.Config{Model: "model", Policy: policy})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = os.WriteFile(
+		policyPath,
+		[]byte(`{"actions":["help"],"modules":["none"],"templates":{"greet":"Hi {{who}}."}}`),
+		0600,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err = reloadPolicy(store, runner, policyPath); err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := store.ParseSubmit([]byte(`{"template":"greet","variables":{"who":"Ada"},"route":"/"}`))
+	if err != nil || resolved.Prompt != "Hi Ada." {
+		t.Fatalf("reloaded template: %#v %v", resolved, err)
+	}
+	if err = os.WriteFile(policyPath, []byte(`{"actions":["navigate"],"modules":["none"]}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err = reloadPolicy(store, runner, policyPath); err == nil {
+		t.Fatal("invalid reload accepted")
+	}
+	resolved, err = store.ParseSubmit([]byte(`{"template":"greet","variables":{"who":"Ada"},"route":"/"}`))
+	if err != nil || resolved.Prompt != "Hi Ada." {
+		t.Fatalf("template after failed reload: %#v %v", resolved, err)
+	}
+	if err = reloadPolicy(store, runner, filepath.Join(t.TempDir(), "missing.json")); err == nil {
+		t.Fatal("missing policy reload accepted")
 	}
 }

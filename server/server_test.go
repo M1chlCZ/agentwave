@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/m1chlcz/agentwave"
 	"github.com/m1chlcz/agentwave/server"
@@ -261,4 +262,98 @@ func TestListenUnixReplacesOnlyAnOwnedStaleSocket(t *testing.T) {
 		t.Fatalf("replace owned stale socket: %v", err)
 	}
 	defer listener.Close()
+}
+
+func awaitReadyJob(t *testing.T, store *agentwave.Store, identity string) {
+	t.Helper()
+	deadline := time.After(5 * time.Second)
+	tick := time.NewTicker(time.Millisecond)
+	defer tick.Stop()
+	for {
+		if current, found := store.Current(identity); found && current.Status != "working" {
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatal("job did not finish")
+		case <-tick.C:
+		}
+	}
+}
+
+func TestMetricsEndpointReportsCounters(t *testing.T) {
+	t.Parallel()
+
+	store := newTestStore(t, func(context.Context, string, string) (agentwave.Suggestion, error) {
+		return agentwave.Suggestion{Message: "Done", Action: "help", Module: "none"}, nil
+	})
+	handler := server.NewWithOptions(store, server.Options{Version: "0.2.0"})
+
+	initial := serveRequest(handler, "GET", "/metrics", "", "")
+	if initial.Code != http.StatusOK {
+		t.Fatalf("metrics status: %d", initial.Code)
+	}
+	if contentType := initial.Header().Get("Content-Type"); !strings.HasPrefix(contentType, "text/plain") {
+		t.Fatalf("metrics content type: %q", contentType)
+	}
+	body := initial.Body.String()
+	for _, want := range []string{
+		`agentwave_build_info{version="0.2.0"} 1`,
+		"# TYPE agentwave_jobs_started_total counter",
+		"agentwave_jobs_started_total 0",
+		"agentwave_jobs_in_flight 0",
+		"agentwave_requests_total{class=\"2xx\"}",
+		"agentwave_uptime_seconds",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("metrics missing %q:\n%s", want, body)
+		}
+	}
+	if got := serveRequest(handler, "POST", "/metrics", "", ""); got.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("metrics POST status: %d", got.Code)
+	}
+	if got := serveRequest(handler, "POST", "/jobs", `{"prompt":"Help","route":"/app"}`, actor); got.Code != http.StatusAccepted {
+		t.Fatalf("submit status: %d", got.Code)
+	}
+	awaitReadyJob(t, store, actor)
+
+	after := serveRequest(handler, "GET", "/metrics", "", "").Body.String()
+	for _, want := range []string{
+		"agentwave_jobs_started_total 1",
+		"agentwave_jobs_completed_total 1",
+		"agentwave_jobs_failed_total 0",
+		"agentwave_requests_total{class=\"4xx\"} 1",
+	} {
+		if !strings.Contains(after, want) {
+			t.Fatalf("metrics missing %q:\n%s", want, after)
+		}
+	}
+}
+
+func TestMetricsEndpointAcceptsTemplateSubmissions(t *testing.T) {
+	t.Parallel()
+
+	policy := testPolicy()
+	policy.Templates = map[string]string{"lookup_item": "Find the item {{item}}."}
+	store, err := agentwave.NewStore(
+		context.Background(),
+		policy,
+		func(context.Context, string, string) (agentwave.Suggestion, error) {
+			return agentwave.Suggestion{Message: "Done", Action: "help", Module: "none"}, nil
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(store.Close)
+	handler := server.New(store)
+	body := `{"template":"lookup_item","variables":{"item":"oak"},"route":"/app/items"}`
+	if got := serveRequest(handler, "POST", "/jobs", body, actor); got.Code != http.StatusAccepted {
+		t.Fatalf("template submit status: %d", got.Code)
+	}
+	awaitReadyJob(t, store, actor)
+	current, found := store.Current(actor)
+	if !found || current.Prompt != "Find the item oak." {
+		t.Fatalf("stored job: %#v", current)
+	}
 }

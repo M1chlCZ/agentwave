@@ -6,12 +6,15 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"mime"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -26,28 +29,63 @@ const (
 	socketProbeTimeout  = 200 * time.Millisecond
 )
 
+// Options configures a handler.
+type Options struct {
+	// ActorHeader is the request header that identifies the calling actor; an
+	// empty value falls back to ActorHeader.
+	ActorHeader string
+	// The metrics endpoint reports Version; it defaults to "dev".
+	Version string
+}
+
 // New returns a handler that reads the actor from ActorHeader.
 func New(store *agentwave.Store) http.Handler {
-	return NewWithActorHeader(store, ActorHeader)
+	return NewWithOptions(store, Options{})
 }
 
 // NewWithActorHeader returns a handler that reads the actor from actorHeader;
 // an empty actorHeader falls back to ActorHeader.
 func NewWithActorHeader(store *agentwave.Store, actorHeader string) http.Handler {
+	return NewWithOptions(store, Options{ActorHeader: actorHeader})
+}
+
+// NewWithOptions returns a handler with explicit options. The /metrics and
+// /healthz endpoints do not require an actor header; they are operational
+// endpoints like the socket itself. The /metrics response exposes counters
+// only, never prompts, routes or suggestions.
+func NewWithOptions(store *agentwave.Store, options Options) http.Handler {
+	actorHeader := options.ActorHeader
 	if actorHeader == "" {
 		actorHeader = ActorHeader
 	}
+	version := options.Version
+	if version == "" {
+		version = "dev"
+	}
+	metrics := &metrics{version: version, startedAt: time.Now()}
 	return http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
-		serve(store, actorHeader, response, request)
+		recorder := &statusRecorder{ResponseWriter: response}
+		defer func() { metrics.observe(recorder.statusCode()) }()
+		serve(store, actorHeader, metrics, recorder, request)
 	})
 }
 
-func serve(store *agentwave.Store, actorHeader string, response http.ResponseWriter, request *http.Request) {
+func serve(
+	store *agentwave.Store,
+	actorHeader string,
+	metrics *metrics,
+	response http.ResponseWriter,
+	request *http.Request,
+) {
 	response.Header().Set("Cache-Control", "no-store")
 	response.Header().Set("X-Content-Type-Options", "nosniff")
 	if isHealthRequest(request) {
 		response.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		_, _ = io.WriteString(response, "ok\n")
+		return
+	}
+	if isMetricsRequest(request) {
+		serveMetrics(metrics, store, response, request)
 		return
 	}
 	actor, valid := requestActor(request, actorHeader)
@@ -71,6 +109,97 @@ func serve(store *agentwave.Store, actorHeader string, response http.ResponseWri
 
 func isHealthRequest(request *http.Request) bool {
 	return request.URL.Path == "/healthz" && request.Method == http.MethodGet && request.URL.RawQuery == ""
+}
+
+func isMetricsRequest(request *http.Request) bool {
+	return request.URL.Path == "/metrics" && request.URL.RawQuery == ""
+}
+
+func serveMetrics(metrics *metrics, store *agentwave.Store, response http.ResponseWriter, request *http.Request) {
+	if request.Method != http.MethodGet {
+		response.Header().Set("Allow", "GET")
+		fail(response, http.StatusMethodNotAllowed)
+		return
+	}
+	metrics.write(store, response)
+}
+
+type metrics struct {
+	version   string
+	startedAt time.Time
+	requests  [5]atomic.Int64
+}
+
+func (metrics *metrics) observe(status int) {
+	class := status / 100
+	if class < 1 || class > len(metrics.requests) {
+		class = 5
+	}
+	metrics.requests[class-1].Add(1)
+}
+
+func (metrics *metrics) write(store *agentwave.Store, response http.ResponseWriter) {
+	stats := store.Stats()
+	response.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+	var builder strings.Builder
+	builder.WriteString("# HELP agentwave_build_info Build information.\n")
+	builder.WriteString("# TYPE agentwave_build_info gauge\n")
+	fmt.Fprintf(&builder, "agentwave_build_info{version=%q} 1\n", metrics.version)
+	builder.WriteString("# HELP agentwave_jobs_started_total Admitted generations.\n")
+	builder.WriteString("# TYPE agentwave_jobs_started_total counter\n")
+	fmt.Fprintf(&builder, "agentwave_jobs_started_total %d\n", stats.StartedGenerations)
+	builder.WriteString("# HELP agentwave_jobs_completed_total Generations that produced a ready suggestion.\n")
+	builder.WriteString("# TYPE agentwave_jobs_completed_total counter\n")
+	fmt.Fprintf(&builder, "agentwave_jobs_completed_total %d\n", stats.ReadyGenerations)
+	builder.WriteString("# HELP agentwave_jobs_failed_total Generations that failed.\n")
+	builder.WriteString("# TYPE agentwave_jobs_failed_total counter\n")
+	fmt.Fprintf(&builder, "agentwave_jobs_failed_total %d\n", stats.FailedGenerations)
+	builder.WriteString("# HELP agentwave_jobs_in_flight Generations currently running.\n")
+	builder.WriteString("# TYPE agentwave_jobs_in_flight gauge\n")
+	fmt.Fprintf(&builder, "agentwave_jobs_in_flight %d\n", stats.ActiveGenerations)
+	builder.WriteString("# HELP agentwave_entries_live Live suggestion entries.\n")
+	builder.WriteString("# TYPE agentwave_entries_live gauge\n")
+	fmt.Fprintf(&builder, "agentwave_entries_live %d\n", stats.LiveEntries)
+	builder.WriteString("# HELP agentwave_requests_total HTTP responses by status class.\n")
+	builder.WriteString("# TYPE agentwave_requests_total counter\n")
+	for class := range metrics.requests {
+		fmt.Fprintf(
+			&builder,
+			"agentwave_requests_total{class=%q} %d\n",
+			fmt.Sprintf("%dxx", class+1),
+			metrics.requests[class].Load(),
+		)
+	}
+	builder.WriteString("# HELP agentwave_uptime_seconds Seconds since start.\n")
+	builder.WriteString("# TYPE agentwave_uptime_seconds gauge\n")
+	fmt.Fprintf(&builder, "agentwave_uptime_seconds %.3f\n", time.Since(metrics.startedAt).Seconds())
+	_, _ = io.WriteString(response, builder.String())
+}
+
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+}
+
+func (recorder *statusRecorder) WriteHeader(status int) {
+	if recorder.status == 0 {
+		recorder.status = status
+	}
+	recorder.ResponseWriter.WriteHeader(status)
+}
+
+func (recorder *statusRecorder) Write(body []byte) (int, error) {
+	if recorder.status == 0 {
+		recorder.status = http.StatusOK
+	}
+	return recorder.ResponseWriter.Write(body)
+}
+
+func (recorder *statusRecorder) statusCode() int {
+	if recorder.status == 0 {
+		return http.StatusOK
+	}
+	return recorder.status
 }
 
 func requestActor(request *http.Request, actorHeader string) (string, bool) {
@@ -110,7 +239,7 @@ func serveSubmit(store *agentwave.Store, actor string, response http.ResponseWri
 	if !read {
 		return
 	}
-	input, err := store.ParseInput(body)
+	input, err := store.ParseSubmit(body)
 	if err != nil {
 		fail(response, http.StatusUnprocessableEntity)
 		return

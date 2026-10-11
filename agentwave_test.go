@@ -388,3 +388,207 @@ func awaitFinished(t *testing.T, store *Store, actor string) Job {
 		}
 	}
 }
+
+func testPolicyWithTemplates() Policy {
+	policy := testPolicy()
+	policy.Templates = map[string]string{
+		"lookup_item": "Find the item {{item}} and prepare a lookup suggestion.",
+	}
+	return policy
+}
+
+func TestPolicyTemplateValidation(t *testing.T) {
+	t.Parallel()
+
+	for _, templates := range []map[string]string{
+		{"greet": "Say hello."},
+		{"one": "Use {{name}} now."},
+		{"twice": "{{a}} then {{a}} again."},
+	} {
+		policy := testPolicy()
+		policy.Templates = templates
+		if err := policy.Validate(); err != nil {
+			t.Fatalf("valid templates rejected: %v", err)
+		}
+	}
+	for _, templates := range []map[string]string{
+		{"Bad": "text"},
+		{"ok": ""},
+		{"ok": "   "},
+		{"ok": "brace } alone"},
+		{"ok": "single { brace"},
+		{"ok": "unclosed {{name"},
+		{"ok": "bad name {{not valid}}"},
+		{"ok": "empty {{}}"},
+		{"ok": strings.Repeat("x", messageLimit+1)},
+	} {
+		policy := testPolicy()
+		policy.Templates = templates
+		if err := policy.Validate(); err == nil {
+			t.Fatalf("invalid templates accepted: %#v", templates)
+		}
+	}
+}
+
+func TestResolveInputTemplates(t *testing.T) {
+	t.Parallel()
+
+	policy := testPolicyWithTemplates()
+	resolved, err := policy.ResolveInput(Input{
+		Template:  "lookup_item",
+		Variables: map[string]string{"item": "oak table"},
+		Route:     "/app/items",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved.Prompt != "Find the item oak table and prepare a lookup suggestion." ||
+		resolved.Route != "/app/items" {
+		t.Fatalf("resolved input: %#v", resolved)
+	}
+	if resolved, err = policy.ResolveInput(Input{Prompt: "Plain request", Route: "/app"}); err != nil ||
+		resolved.Prompt != "Plain request" {
+		t.Fatalf("plain input: %#v %v", resolved, err)
+	}
+	for _, input := range []Input{
+		{Template: "missing", Route: "/app", Variables: map[string]string{"item": "x"}},
+		{Template: "lookup_item", Route: "/app"},
+		{Template: "lookup_item", Route: "/app", Variables: map[string]string{"other": "x"}},
+		{Template: "lookup_item", Route: "/app", Variables: map[string]string{"item": "x", "extra": "y"}},
+		{Template: "lookup_item", Prompt: "Both", Route: "/app", Variables: map[string]string{"item": "x"}},
+		{Prompt: "Prompt", Route: "/app", Variables: map[string]string{"item": "x"}},
+		{Route: "/app"},
+		{Template: "lookup_item", Route: "/other", Variables: map[string]string{"item": "x"}},
+	} {
+		if _, err := policy.ResolveInput(input); !errors.Is(err, ErrInvalid) {
+			t.Fatalf("input accepted: %#v", input)
+		}
+	}
+}
+
+func TestParseSubmitStrictness(t *testing.T) {
+	t.Parallel()
+
+	policy := testPolicyWithTemplates()
+	input, err := policy.ParseSubmit(
+		[]byte(`{"template":"lookup_item","variables":{"item":"oak"},"route":"/app/items"}`),
+	)
+	if err != nil || input.Prompt != "Find the item oak and prepare a lookup suggestion." {
+		t.Fatalf("template submit: %#v %v", input, err)
+	}
+	plain, err := policy.ParseSubmit([]byte(`{"prompt":"Hi","route":"/app"}`))
+	if err != nil || plain.Prompt != "Hi" {
+		t.Fatalf("plain submit: %#v %v", plain, err)
+	}
+	for _, body := range []string{
+		`{"prompt":"Hi","route":"/app","command":"id"}`,
+		`{"prompt":"Hi","route":"/app","variables":{"item":"x"}}`,
+		`{"template":"lookup_item","route":"/app","variables":{"item":7}}`,
+		`{"template":"lookup_item","route":"/app","variables":{"Bad":"x"}}`,
+		`{"template":"lookup_item","route":"/app","variables":[]}`,
+		`{"template":"lookup_item","route":"/app","variables":{"item":"x","item":"y"}}`,
+		`{"prompt":"Hi","prompt":"Again","route":"/app"}`,
+		`{}`,
+		`{"prompt":"Hi","route":"/app"} trailing`,
+	} {
+		if _, err := policy.ParseSubmit([]byte(body)); !errors.Is(err, ErrInvalid) {
+			t.Fatalf("submit accepted: %s", body)
+		}
+	}
+}
+
+func TestStoreStatsCounters(t *testing.T) {
+	t.Parallel()
+
+	release := make(chan struct{})
+	store, err := NewStore(
+		context.Background(),
+		testPolicy(),
+		func(ctx context.Context, _, _ string) (Suggestion, error) {
+			select {
+			case <-release:
+				return Suggestion{Message: "Done", Action: actionHelp, Module: moduleNone}, nil
+			case <-ctx.Done():
+				return Suggestion{}, ctx.Err()
+			}
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(store.Close)
+	if _, err := store.Submit(actorA, "First request", "/app"); err != nil {
+		t.Fatal(err)
+	}
+	awaitActive := func(want int) Stats {
+		t.Helper()
+		deadline := time.After(5 * time.Second)
+		tick := time.NewTicker(time.Millisecond)
+		defer tick.Stop()
+		for {
+			stats := store.Stats()
+			if stats.ActiveGenerations == want {
+				return stats
+			}
+			select {
+			case <-deadline:
+				t.Fatalf("active generations never reached %d", want)
+			case <-tick.C:
+			}
+		}
+	}
+	stats := awaitActive(1)
+	if stats.StartedGenerations != 1 || stats.LiveEntries != 1 || stats.EntryLimit != entryLimit {
+		t.Fatalf("working stats: %#v", stats)
+	}
+	close(release)
+	_ = awaitFinished(t, store, actorA)
+	stats = awaitActive(0)
+	if stats.StartedGenerations != 1 || stats.ReadyGenerations != 1 || stats.FailedGenerations != 0 {
+		t.Fatalf("ready stats: %#v", stats)
+	}
+}
+
+func TestReloadPolicy(t *testing.T) {
+	t.Parallel()
+
+	store, err := NewStore(
+		context.Background(),
+		testPolicy(),
+		func(context.Context, string, string) (Suggestion, error) {
+			return Suggestion{Message: "Done", Action: actionHelp, Module: moduleNone}, nil
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(store.Close)
+	templateInput := Input{
+		Template:  "lookup_item",
+		Variables: map[string]string{"item": "x"},
+		Route:     "/app/items",
+	}
+	if _, err := store.SubmitInput(actorA, templateInput); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("template before reload: %v", err)
+	}
+	if err := store.ReloadPolicy(testPolicyWithTemplates()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.SubmitInput(actorA, templateInput); err != nil {
+		t.Fatalf("template after reload: %v", err)
+	}
+	if err := store.ReloadPolicy(Policy{Actions: []string{"navigate"}, Modules: []string{"none"}}); err == nil {
+		t.Fatal("invalid policy accepted")
+	}
+	if _, err := store.SubmitInput(actorB, templateInput); err != nil {
+		t.Fatalf("template after failed reload: %v", err)
+	}
+	closed, err := NewStore(context.Background(), testPolicy(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	closed.Close()
+	if err := closed.ReloadPolicy(testPolicy()); !errors.Is(err, ErrCapacity) {
+		t.Fatalf("closed store reload: %v", err)
+	}
+}

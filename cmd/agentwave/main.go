@@ -24,7 +24,7 @@ import (
 	"github.com/m1chlcz/agentwave/server"
 )
 
-const version = "0.1.0"
+const version = "0.2.0"
 
 const shutdownTimeout = 10 * time.Second
 
@@ -50,6 +50,7 @@ type policyDocument struct {
 	QueryActions map[string]string `json:"queryActions"`
 	Working      string            `json:"working"`
 	Failed       string            `json:"failed"`
+	Templates    map[string]string `json:"templates"`
 }
 
 func (document policyDocument) policy() agentwave.Policy {
@@ -60,6 +61,7 @@ func (document policyDocument) policy() agentwave.Policy {
 		QueryActions: document.QueryActions,
 		Working:      document.Working,
 		Failed:       document.Failed,
+		Templates:    document.Templates,
 	}
 }
 
@@ -97,7 +99,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return exitUsage
 	}
 	defer store.Close()
-	return serve(ctx, parsed, store, stderr)
+	return serve(ctx, parsed, store, runner, stderr)
 }
 
 func validateOptions(parsed options, stderr io.Writer) int {
@@ -116,7 +118,13 @@ func validateOptions(parsed options, stderr io.Writer) int {
 	return exitUsage
 }
 
-func serve(ctx context.Context, parsed options, store *agentwave.Store, stderr io.Writer) int {
+func serve(
+	ctx context.Context,
+	parsed options,
+	store *agentwave.Store,
+	runner *codex.Runner,
+	stderr io.Writer,
+) int {
 	listener, err := server.ListenUnix(parsed.socket)
 	if err != nil {
 		fmt.Fprintf(stderr, "agentwave: listen on %s: %v\n", parsed.socket, err)
@@ -129,7 +137,22 @@ func serve(ctx context.Context, parsed options, store *agentwave.Store, stderr i
 		return exitFailure
 	}
 	logger := log.New(stderr, "agentwave: ", log.LstdFlags)
-	service := &http.Server{Handler: server.New(store), ReadHeaderTimeout: shutdownTimeout}
+	reload := make(chan os.Signal, 1)
+	signal.Notify(reload, syscall.SIGHUP)
+	defer signal.Stop(reload)
+	go func() {
+		for range reload {
+			if reloadErr := reloadPolicy(store, runner, parsed.policy); reloadErr != nil {
+				logger.Printf("policy reload failed: %v", reloadErr)
+				continue
+			}
+			logger.Printf("policy reloaded from %s", parsed.policy)
+		}
+	}()
+	service := &http.Server{
+		Handler:           server.NewWithOptions(store, server.Options{Version: version}),
+		ReadHeaderTimeout: shutdownTimeout,
+	}
 	served := make(chan error, 1)
 	go func() { served <- service.Serve(listener) }()
 	logger.Printf("listening on %s with model %s", parsed.socket, parsed.model)
@@ -197,6 +220,17 @@ func loadPolicy(path string) (agentwave.Policy, error) {
 		return agentwave.Policy{}, fmt.Errorf("invalid policy %s: %w", path, validateErr)
 	}
 	return policy, nil
+}
+
+func reloadPolicy(store *agentwave.Store, runner *codex.Runner, path string) error {
+	policy, err := loadPolicy(path)
+	if err != nil {
+		return err
+	}
+	if err = store.ReloadPolicy(policy); err != nil {
+		return err
+	}
+	return runner.ReloadPolicy(policy)
 }
 
 func removeOwnedSocket(path string, created os.FileInfo) {

@@ -4,5 +4,8 @@
   "routePrefix": "/admin",
   "queryActions": {
     "lookup": "contacts"
+  },
+  "templates": {
+    "lookup_contact": "Find the contact {{name}} and prepare a lookup suggestion."
   }
 }

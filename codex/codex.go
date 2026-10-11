@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -90,6 +91,7 @@ type Runner struct {
 	model        string
 	home         string
 	instructions string
+	policyMu     sync.RWMutex
 	policy       agentwave.Policy
 	timeout      time.Duration
 }
@@ -133,9 +135,23 @@ func New(config Config) (*Runner, error) {
 	}, nil
 }
 
+// ReloadPolicy validates and replaces the suggestion vocabulary. It waits for
+// running generations; later generations use the new vocabulary.
+func (runner *Runner) ReloadPolicy(policy agentwave.Policy) error {
+	if err := policy.Validate(); err != nil {
+		return err
+	}
+	runner.policyMu.Lock()
+	defer runner.policyMu.Unlock()
+	runner.policy = policy.Normalized()
+	return nil
+}
+
 // Generate validates the input, runs one sandboxed generation and returns a
 // policy-valid suggestion.
 func (runner *Runner) Generate(ctx context.Context, prompt, route string) (agentwave.Suggestion, error) {
+	runner.policyMu.RLock()
+	defer runner.policyMu.RUnlock()
 	input, err := runner.policy.ValidateInput(prompt, route)
 	if err != nil {
 		return agentwave.Suggestion{}, err

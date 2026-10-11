@@ -213,6 +213,7 @@ The browser calls `GET /assistant/healthz`, `POST /assistant/jobs` and
 | `queryActions` | No | Maps an action to the module that a non-empty query requires. |
 | `working` | No | Job message during generation. |
 | `failed` | No | Job message after a failed generation. |
+| `templates` | No | Maps a template name to text with `{{name}}` placeholders. |
 
 The policy fixes the reserved action rules:
 
@@ -223,18 +224,40 @@ The policy fixes the reserved action rules:
 The service rejects a suggestion outside the policy. The model cannot invent a
 new action or module.
 
+Templates only shape the prompt text. `{{name}}` placeholders use lowercase
+names, every placeholder must be provided exactly once through `variables`, and
+unused variables are rejected. A template cannot set actions, modules or
+queries, and it cannot inject commands: it becomes ordinary prompt text before
+validation.
+
 ## HTTP API
 
 | Route | Method | Purpose | Responses |
 | --- | --- | --- | --- |
 | `/healthz` | `GET` | Liveness check. | `200` |
-| `/jobs` | `POST` | Accept one prompt and route. | `202`, `401`, `409`, `415`, `422`, `503` |
+| `/metrics` | `GET` | Prometheus metrics for operations. | `200`, `405` |
+| `/jobs` | `POST` | Accept one prompt or template request. | `202`, `401`, `409`, `415`, `422`, `503` |
 | `/job` | `GET` | Return the current job of the actor. | `200`, `204`, `401`, `405`, `422` |
 
-Every route except `/healthz` requires exactly one `X-Actor-Id` header with a
-lowercase UUID. The body of a `POST /jobs` request is
-`{"prompt":"...","route":"..."}` with `Content-Type: application/json`. The
-service marks each response as `Cache-Control: no-store`.
+Every route except `/healthz` and `/metrics` requires exactly one `X-Actor-Id`
+header with a lowercase UUID. The body of a `POST /jobs` request is
+`{"prompt":"...","route":"..."}` or
+`{"template":"...","variables":{"name":"..."},"route":"..."}` with
+`Content-Type: application/json`. The service marks each response as
+`Cache-Control: no-store`.
+
+## Operations
+
+Send `SIGHUP` to reload the policy file without a restart. The store and the
+runner validate the new policy first; on a parse or validation error the
+previous policy stays active and the error is logged. Running generations
+finish under the policy they started with.
+
+`GET /metrics` returns Prometheus text exposition format: job counters
+(started, completed, failed), in-flight generations, live entries, response
+counts by status class, build info and uptime. The endpoint needs no actor
+header because it exposes counters only, never prompts, routes or suggestions;
+the socket permissions still restrict access to the service group.
 
 ## Security model
 

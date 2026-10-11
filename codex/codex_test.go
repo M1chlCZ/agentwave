@@ -40,6 +40,26 @@ func newTestRunner(t *testing.T) *Runner {
 	return runner
 }
 
+func TestReloadPolicyValidatesAndSwaps(t *testing.T) {
+	t.Parallel()
+
+	runner := newTestRunner(t)
+	if err := runner.ReloadPolicy(agentwave.Policy{Actions: []string{"navigate"}, Modules: []string{"none"}}); err == nil {
+		t.Fatal("invalid policy accepted")
+	}
+	updated := testPolicy()
+	updated.Templates = map[string]string{"greet": "Hello."}
+	if err := runner.ReloadPolicy(updated); err != nil {
+		t.Fatal(err)
+	}
+	runner.policyMu.RLock()
+	templates := runner.policy.Templates
+	runner.policyMu.RUnlock()
+	if templates["greet"] != "Hello." {
+		t.Fatalf("templates after reload: %#v", templates)
+	}
+}
+
 func TestNewValidatesConfiguration(t *testing.T) {
 	t.Parallel()
 
