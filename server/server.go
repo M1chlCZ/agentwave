@@ -11,8 +11,10 @@ import (
 	"mime"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -27,7 +29,11 @@ const ActorHeader = "X-Actor-Id"
 const (
 	maxRequestBodyBytes = 64 * 1024
 	socketProbeTimeout  = 200 * time.Millisecond
+	historyLimitDefault = 20
+	historyLimitMax     = 100
 )
+
+var sseKeepAlive = 15 * time.Second
 
 // Options configures a handler.
 type Options struct {
@@ -93,18 +99,50 @@ func serve(
 		fail(response, http.StatusUnauthorized)
 		return
 	}
-	if request.URL.RawQuery != "" || request.URL.ForceQuery || request.URL.RawPath != "" {
-		fail(response, http.StatusUnprocessableEntity)
-		return
-	}
 	switch request.URL.Path {
 	case "/job":
+		if rejectQuery(request, response) {
+			return
+		}
 		serveCurrentJob(store, actor, response, request)
 	case "/jobs":
+		if rejectQuery(request, response) {
+			return
+		}
 		serveSubmit(store, actor, response, request)
+	case "/jobs/history":
+		serveJobHistory(store, actor, response, request)
 	default:
+		if id, ok := eventsJobID(request.URL.Path); ok {
+			serveJobEvents(store, actor, id, response, request)
+			return
+		}
+		if rejectQuery(request, response) {
+			return
+		}
 		fail(response, http.StatusNotFound)
 	}
+}
+
+func rejectQuery(request *http.Request, response http.ResponseWriter) bool {
+	if request.URL.RawQuery == "" && !request.URL.ForceQuery && request.URL.RawPath == "" {
+		return false
+	}
+	fail(response, http.StatusUnprocessableEntity)
+	return true
+}
+
+func eventsJobID(path string) (string, bool) {
+	const prefix = "/jobs/"
+	const suffix = "/events"
+	if !strings.HasPrefix(path, prefix) || !strings.HasSuffix(path, suffix) {
+		return "", false
+	}
+	id := path[len(prefix) : len(path)-len(suffix)]
+	if len(id) != 32 || strings.Trim(id, "0123456789abcdef") != "" {
+		return "", false
+	}
+	return id, true
 }
 
 func isHealthRequest(request *http.Request) bool {
@@ -195,6 +233,12 @@ func (recorder *statusRecorder) Write(body []byte) (int, error) {
 	return recorder.ResponseWriter.Write(body)
 }
 
+func (recorder *statusRecorder) Flush() {
+	if flusher, ok := recorder.ResponseWriter.(http.Flusher); ok {
+		flusher.Flush()
+	}
+}
+
 func (recorder *statusRecorder) statusCode() int {
 	if recorder.status == 0 {
 		return http.StatusOK
@@ -259,6 +303,106 @@ func serveSubmit(store *agentwave.Store, actor string, response http.ResponseWri
 	writeJob(response, current, http.StatusAccepted)
 }
 
+func serveJobHistory(store *agentwave.Store, actor string, response http.ResponseWriter, request *http.Request) {
+	if request.Method != http.MethodGet {
+		response.Header().Set("Allow", "GET")
+		fail(response, http.StatusMethodNotAllowed)
+		return
+	}
+	limit, ok := parseHistoryLimit(request)
+	if !ok {
+		fail(response, http.StatusUnprocessableEntity)
+		return
+	}
+	response.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(response).Encode(store.History(actor, limit))
+}
+
+func parseHistoryLimit(request *http.Request) (int, bool) {
+	if request.URL.ForceQuery || request.URL.RawPath != "" {
+		return 0, false
+	}
+	if request.URL.RawQuery == "" {
+		return historyLimitDefault, true
+	}
+	values, err := url.ParseQuery(request.URL.RawQuery)
+	if err != nil || len(values) != 1 || len(values["limit"]) != 1 {
+		return 0, false
+	}
+	limit, err := strconv.Atoi(values["limit"][0])
+	if err != nil || limit < 1 || limit > historyLimitMax {
+		return 0, false
+	}
+	return limit, true
+}
+
+func serveJobEvents(store *agentwave.Store, actor, id string, response http.ResponseWriter, request *http.Request) {
+	if request.Method != http.MethodGet {
+		response.Header().Set("Allow", "GET")
+		fail(response, http.StatusMethodNotAllowed)
+		return
+	}
+	once, ok := parseEventsQuery(request)
+	if !ok {
+		fail(response, http.StatusUnprocessableEntity)
+		return
+	}
+	watcher, current, found := store.WatchJob(actor, id)
+	if !found {
+		fail(response, http.StatusNotFound)
+		return
+	}
+	defer watcher.Close()
+	response.Header().Set("Content-Type", "text/event-stream")
+	writeJobEvent(response, current)
+	flush(response)
+	if once {
+		return
+	}
+	keepAlive := time.NewTicker(sseKeepAlive)
+	defer keepAlive.Stop()
+	for {
+		select {
+		case <-request.Context().Done():
+			return
+		case update, open := <-watcher.Events():
+			if !open {
+				return
+			}
+			writeJobEvent(response, update)
+			flush(response)
+		case <-keepAlive.C:
+			_, _ = io.WriteString(response, ": keep-alive\n\n")
+			flush(response)
+		}
+	}
+}
+
+func parseEventsQuery(request *http.Request) (bool, bool) {
+	if request.URL.ForceQuery || request.URL.RawPath != "" {
+		return false, false
+	}
+	if request.URL.RawQuery == "" {
+		return false, true
+	}
+	values, err := url.ParseQuery(request.URL.RawQuery)
+	if err != nil || len(values) != 1 || len(values["once"]) != 1 || values["once"][0] != "1" {
+		return false, false
+	}
+	return true, true
+}
+
+func writeJobEvent(response http.ResponseWriter, current agentwave.Job) {
+	payload, _ := json.Marshal(current)
+	_, _ = fmt.Fprintf(response, "event: %s\ndata: %s\n\n", current.Status, payload)
+}
+
+func flush(response http.ResponseWriter) {
+	if flusher, ok := response.(http.Flusher); ok {
+		flusher.Flush()
+	}
+}
+
 func readSubmitBody(response http.ResponseWriter, request *http.Request) ([]byte, bool) {
 	reader := http.MaxBytesReader(response, request.Body, maxRequestBodyBytes)
 	defer func() { _ = reader.Close() }()
@@ -314,8 +458,7 @@ func ListenUnix(path string) (net.Listener, error) {
 }
 
 func removeStaleSocket(path string, info os.FileInfo) error {
-	stat, owned := info.Sys().(*syscall.Stat_t)
-	if info.Mode()&os.ModeSocket == 0 || !owned || int(stat.Uid) != os.Geteuid() {
+	if info.Mode()&os.ModeSocket == 0 || !ownedSocket(info) {
 		return errors.New("refusing to replace socket path")
 	}
 	dialer := net.Dialer{Timeout: socketProbeTimeout}

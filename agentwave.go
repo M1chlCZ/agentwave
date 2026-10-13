@@ -27,6 +27,8 @@ import (
 const (
 	entryLimit        = 32
 	generationLimit   = 2
+	historyLimit      = 64
+	watcherLimit      = 4
 	entryTTL          = 15 * time.Minute
 	generationTimeout = 120 * time.Second
 	messageLimit      = 2000
@@ -109,6 +111,13 @@ type Job struct {
 // Generator produces one suggestion for a prompt and route.
 type Generator func(context.Context, string, string) (Suggestion, error)
 
+// Options configures a Store.
+type Options struct {
+	// HistoryCapacity bounds the completed-job history; a zero or negative
+	// value selects the default of 64 entries.
+	HistoryCapacity int
+}
+
 type entry struct {
 	job     Job
 	expires time.Time
@@ -116,37 +125,57 @@ type entry struct {
 
 // Store holds at most one live job per actor under a fixed policy.
 type Store struct {
-	mu       sync.Mutex
-	entries  map[string]entry
-	active   int
-	started  int64
-	ready    int64
-	failed   int64
-	closed   bool
-	ctx      context.Context
-	cancel   context.CancelFunc
-	workers  sync.WaitGroup
-	generate Generator
-	policy   Policy
-	now      func() time.Time
-	timeout  time.Duration
+	mu              sync.Mutex
+	entries         map[string]entry
+	history         []historyRecord
+	watchers        map[string]map[*JobWatcher]struct{}
+	historyCapacity int
+	active          int
+	started         int64
+	ready           int64
+	failed          int64
+	closed          bool
+	ctx             context.Context
+	cancel          context.CancelFunc
+	workers         sync.WaitGroup
+	generate        Generator
+	policy          Policy
+	now             func() time.Time
+	timeout         time.Duration
 }
 
 // NewStore validates the policy and returns a store whose generations run
 // under parent.
 func NewStore(parent context.Context, policy Policy, generate Generator) (*Store, error) {
+	return NewStoreWithOptions(parent, policy, generate, Options{})
+}
+
+// NewStoreWithOptions validates the policy and returns a store with explicit
+// options.
+func NewStoreWithOptions(
+	parent context.Context,
+	policy Policy,
+	generate Generator,
+	options Options,
+) (*Store, error) {
 	if err := policy.Validate(); err != nil {
 		return nil, err
 	}
+	capacity := options.HistoryCapacity
+	if capacity <= 0 {
+		capacity = historyLimit
+	}
 	ctx, cancel := context.WithCancel(parent)
 	return &Store{
-		entries:  make(map[string]entry),
-		ctx:      ctx,
-		cancel:   cancel,
-		generate: generate,
-		policy:   policy.Normalized(),
-		now:      time.Now,
-		timeout:  generationTimeout,
+		entries:         make(map[string]entry),
+		watchers:        make(map[string]map[*JobWatcher]struct{}),
+		historyCapacity: capacity,
+		ctx:             ctx,
+		cancel:          cancel,
+		generate:        generate,
+		policy:          policy.Normalized(),
+		now:             time.Now,
+		timeout:         generationTimeout,
 	}, nil
 }
 
@@ -242,6 +271,8 @@ func (store *Store) run(actor string, current Job) {
 			saved.job = current
 			store.entries[actor] = saved
 		}
+		store.recordLocked(actor, current)
+		store.notifyLocked(actor, current)
 	}()
 	suggestion, err = store.generate(ctx, current.Prompt, current.Route)
 }
@@ -267,13 +298,17 @@ func (store *Store) expireLocked() {
 	}
 }
 
-// Close stops the store and waits for running generations.
+// Close stops the store, waits for running generations and closes every open
+// subscription.
 func (store *Store) Close() {
 	store.mu.Lock()
 	store.closed = true
 	store.cancel()
 	store.mu.Unlock()
 	store.workers.Wait()
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	store.closeWatchersLocked()
 }
 
 // Stats is a snapshot of the store counters and occupancy.
@@ -284,6 +319,7 @@ type Stats struct {
 	ActiveGenerations  int
 	LiveEntries        int
 	EntryLimit         int
+	Watchers           int
 }
 
 // Stats returns a snapshot of the counters and occupancy.
@@ -291,6 +327,10 @@ func (store *Store) Stats() Stats {
 	store.mu.Lock()
 	defer store.mu.Unlock()
 	store.expireLocked()
+	watchers := 0
+	for _, registered := range store.watchers {
+		watchers += len(registered)
+	}
 	return Stats{
 		StartedGenerations: store.started,
 		ReadyGenerations:   store.ready,
@@ -298,6 +338,7 @@ func (store *Store) Stats() Stats {
 		ActiveGenerations:  store.active,
 		LiveEntries:        len(store.entries),
 		EntryLimit:         entryLimit,
+		Watchers:           watchers,
 	}
 }
 

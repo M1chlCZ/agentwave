@@ -17,7 +17,6 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 	"unicode/utf8"
 
@@ -362,17 +361,7 @@ func (runner *Runner) commandFor(ctx context.Context, root, prompt string) *exec
 }
 
 func runProcess(ctx context.Context, command *exec.Cmd, stdoutLimit, stderrLimit int) ([]byte, error) {
-	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	kill := func() error {
-		if command.Process == nil {
-			return os.ErrProcessDone
-		}
-		err := syscall.Kill(-command.Process.Pid, syscall.SIGKILL)
-		if errors.Is(err, syscall.ESRCH) {
-			return os.ErrProcessDone
-		}
-		return err
-	}
+	kill := prepareCommand(command)
 	command.Cancel = kill
 	command.WaitDelay = waitDelay
 	out := &limitedWriter{limit: stdoutLimit, kill: kill}

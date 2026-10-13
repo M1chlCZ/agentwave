@@ -82,7 +82,7 @@ The command `agentwave --version` prints the version and exits. The flags are
 `--socket` (required), `--policy` (required), `--model` (required), `--codex`
 (default `codex`) and `--home` (optional).
 
-Then call the three routes:
+Then call the routes:
 
 ```sh
 curl --unix-socket /run/agentwave/agentwave.sock http://localhost/healthz
@@ -100,6 +100,17 @@ curl --unix-socket /run/agentwave/agentwave.sock \
 
 `POST /jobs` returns a job in the `working` status. Poll `GET /job` until the
 status is `ready` or `failed`. See [HTTP API](#http-api) for the status codes.
+You can also read the recent history and follow one job as server-sent events:
+
+```sh
+curl --unix-socket /run/agentwave/agentwave.sock \
+  -H 'X-Actor-Id: 11111111-1111-4111-8111-111111111111' \
+  'http://localhost/jobs/history?limit=10'
+
+curl --no-buffer --unix-socket /run/agentwave/agentwave.sock \
+  -H 'X-Actor-Id: 11111111-1111-4111-8111-111111111111' \
+  http://localhost/jobs/JOB_ID/events
+```
 
 ## Deployment
 
@@ -168,7 +179,7 @@ systemctl enable --now agentwave
 
 ## Embedding
 
-A browser cannot open a Unix socket. Your backend proxies the three routes and
+A browser cannot open a Unix socket. Your backend proxies the routes and
 adds the actor id. Use one actor id per user or per session. Never accept the
 actor id from the browser.
 
@@ -205,8 +216,9 @@ createServer((incoming, outgoing) => {
 }).listen(3000);
 ```
 
-The browser calls `GET /assistant/healthz`, `POST /assistant/jobs` and
-`GET /assistant/job`.
+The browser calls `GET /assistant/healthz`, `POST /assistant/jobs`,
+`GET /assistant/job`, `GET /assistant/jobs/history` and
+`GET /assistant/jobs/{id}/events`.
 
 ## Policy reference
 
@@ -243,6 +255,8 @@ validation.
 | `/metrics` | `GET` | Prometheus metrics for operations. | `200`, `405` |
 | `/jobs` | `POST` | Accept one prompt or template request. | `202`, `401`, `409`, `415`, `422`, `503` |
 | `/job` | `GET` | Return the current job of the actor. | `200`, `204`, `401`, `405`, `422` |
+| `/jobs/history` | `GET` | Return completed jobs of the actor, most recent first. | `200`, `401`, `405`, `422` |
+| `/jobs/{id}/events` | `GET` | Stream the state of one job as server-sent events. | `200`, `401`, `404`, `405`, `422` |
 
 Every route except `/healthz` and `/metrics` requires exactly one `X-Actor-Id`
 header with a lowercase UUID. The body of a `POST /jobs` request is
@@ -250,6 +264,34 @@ header with a lowercase UUID. The body of a `POST /jobs` request is
 `{"template":"...","variables":{"name":"..."},"route":"..."}` with
 `Content-Type: application/json`. The service marks each response as
 `Cache-Control: no-store`.
+
+### Job history
+
+`GET /jobs/history` returns a JSON array of the actor's completed jobs, most
+recent first. Each entry carries the same fields as a job response plus
+`finishedAt`, the time when the job reached a terminal status. The history
+never contains jobs of other actors and never exposes the actor id.
+
+The optional `limit` query parameter selects 1 to 100 entries and defaults to
+20; any other query is rejected with `422`. The store keeps at most 64
+completed jobs and drops the oldest entry first. An embedded store changes the
+capacity with `agentwave.NewStoreWithOptions` and
+`Options.HistoryCapacity`. History entries stay visible after the live entry
+expires.
+
+### Job events
+
+`GET /jobs/{id}/events` streams the job as server-sent events. The stream
+starts with the current state and then reports every transition. The event
+name is the job status (`working`, `ready` or `failed`), and the data line is
+the same JSON object that `GET /job` returns. The stream closes when the job
+reaches a terminal status or when the client disconnects. A comment line
+`: keep-alive` is sent every 15 seconds.
+
+Every subscriber has a small bounded buffer. A slow reader is dropped instead
+of blocking the generation worker. With `once=1` the endpoint writes the
+current state as a single event and closes the stream. A job id without a live
+entry yields `404`.
 
 ## Operations
 
@@ -271,7 +313,7 @@ the socket permissions still restrict access to the service group.
 - The policy constrains every suggestion. A result outside the policy becomes a failed job.
 - The service has no access to application data, credentials or mutation endpoints. It stores only the prompts, routes and suggestions that callers send.
 - The container and the systemd unit run as a non-root user.
-- The store keeps at most one job per actor, at most 32 entries for 15 minutes, and at most two concurrent generations with a 120 second timeout.
+- The store keeps at most one job per actor, at most 32 entries for 15 minutes, and at most two concurrent generations with a 120 second timeout. The history keeps at most 64 completed jobs and returns only the calling actor's entries.
 
 ## Development
 

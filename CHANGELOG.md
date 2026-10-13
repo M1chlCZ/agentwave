@@ -3,6 +3,23 @@
 All notable changes to this project are documented in this file. The format
 follows Keep a Changelog, and the project uses semantic versioning.
 
+## [Unreleased]
+
+### Added
+
+- Bounded job history: `GET /jobs/history` returns the calling actor's
+  completed jobs, most recent first, with a `finishedAt` timestamp and the
+  same fields as a job response. The `limit` query parameter accepts 1 to 100
+  entries and defaults to 20. `Store.History`,
+  `NewStoreWithOptions` and `Options.HistoryCapacity` expose the history to
+  embedders; the default capacity is 64 entries.
+- Server-sent events: `GET /jobs/{id}/events` replays the current state and
+  streams transitions until the job finishes or the client disconnects, with
+  `Cache-Control: no-store` and keep-alive comments. `?once=1` returns the
+  current state and closes. Each subscriber uses a bounded buffered channel;
+  a slow subscriber is dropped instead of blocking the worker. `WatchJob`
+  and `JobWatcher` expose the subscription to embedders.
+
 ## [0.2.0] - 2026-11-02
 
 ### Added
